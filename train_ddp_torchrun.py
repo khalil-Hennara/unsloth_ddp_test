@@ -61,15 +61,24 @@ def train(args):
     
     # tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     # model = AutoModelForCausalLM.from_pretrained(args.model_name)
-    if dist.is_initialized():
-        dist.barrier()
-        
+    # if dist.is_initialized():
+    #     dist.barrier()
+    if rank == 0:
+        model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name = args.model_name,
+        max_seq_length = 100,
+        load_in_4bit = False,
+        load_in_8bit=False,
+        full_finetuning=True
+        )
+    dist.barrier()
     model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = args.model_name,
-    max_seq_length = 100,
-    load_in_4bit = False,
-    load_in_8bit=False,
-    full_finetuning=True
+        model_name=args.model_name,
+        max_seq_length=100,
+        load_in_4bit=False,
+        load_in_8bit=False,
+        full_finetuning=True,
+        skip_compilation=True  # Skip compilation on all ranks
     )
     model.to(local_rank)
     model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
