@@ -1,16 +1,3 @@
-# import os
-# # Set these before any torch or unsloth imports
-# # Note: Setting UNSLOTH_COMPILE_DISABLE here would be the ultimate workaround if compilation is the sole issue.
-# # For now, we are trying to MAKE compilation work.
-# # os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
-# os.environ["UNSLOTH_COMPILE_DEBUG"] = 1
-# os.environ["UNSLOTH_ENABLE_LOGGING"] = 1
-# os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL" # PyTorch DDP debug
-# os.environ["NCCL_DEBUG"] = "WARN" # NCCL debug, can be INFO for more verbosity
-# os.environ["UNSLOTH_FULLGRAPH"] = 0
-
-from unsloth import FastLanguageModel
-
 import os
 import torch
 import torch.nn as nn
@@ -96,29 +83,19 @@ def train(args):
         logger.info("Barrier before model loading / Unsloth compilation.")
         dist.barrier()
 
-    logger.info("Loading model with FastLanguageModel.from_pretrained...")
+    logger.info("Loading model with AutoModelForCausalLM.from_pretrained...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=args.model_name,
-        max_seq_length=1024,
-        dtype=torch.bfloat16,
-        load_in_4bit=False,
-        load_in_8bit=False,
-        full_finetuning=True,
-        use_gradient_checkpointing="unsloth",
-        device_map={"": "cuda"},
-        disable_log_stats=False,
-        # Enable compilation but make it distributed-safe
-        # trust_remote_code=False,
-    )
     logger.info("Model and tokenizer loaded.")
 
     # Barrier after model loading / Unsloth compilation
     if world_size > 1:
         logger.info("Barrier after model loading / Unsloth compilation.")
         dist.barrier()
-    if next(model.parameters()).device != current_device:
-        model.to(current_device)
+    # if next(model.parameters()).device != current_device:
+    #     model.to(current_device)
 
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
