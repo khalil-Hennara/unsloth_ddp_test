@@ -36,7 +36,6 @@ def setup():
         dist.init_process_group("nccl")
 
     torch.cuda.set_device(local_rank)
-
     # Log device setup
     # We need a basic logger here before the full one is setup if we want to log this part
     if rank == 0:
@@ -60,7 +59,7 @@ class MyDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         enc = self.tokenizer("Hello world!", return_tensors="pt", padding='max_length', padding_side='right',
-                             max_length=1024)
+                             max_length=4096)
         return {
 
             "input_ids": enc["input_ids"].squeeze(0),
@@ -89,18 +88,49 @@ def train(args):
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model_name,
-        max_seq_length=1024,
+        max_seq_length=4096,
         dtype=torch.bfloat16,
         load_in_4bit=False,
         load_in_8bit=False,
-        full_finetuning=True,
-        use_gradient_checkpointing="unsloth",
+        full_finetuning=False if args.use_lora else True,
+        use_gradient_checkpointing=True,
         device_map={"": "cuda"},
         disable_log_stats=False,
         # Enable compilation but make it distributed-safe
         # trust_remote_code=False,
     )
     logger.info("Model and tokenizer loaded.")
+
+    if args.use_lora:
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=16,  # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj", ],
+            lora_alpha=16,
+            lora_dropout=0,  # Supports any, but = 0 is optimized
+            bias="none",  # Supports any, but = "none" is optimized
+            # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
+            use_gradient_checkpointing=True,  # True or "unsloth" for very long context
+            random_state=3407,
+            use_rslora=False,  # We support rank stabilized LoRA
+            loftq_config=None,  # And LoftQ
+        )
+    if rank == 0 and args.use_lora:
+        # log on the main process only
+        total_trainable = 0
+        total_frozen = 0
+        for p in model.parameters():
+            if p.requires_grad:
+                total_trainable += p.numel()
+            else:
+                total_frozen += p.numel()
+
+        logger.info(
+            f"Model parameter count ⇒ "
+            f"trainable: {total_trainable:,}  |  frozen: {total_frozen:,}  "
+            f"({100 * total_trainable / (total_trainable + total_frozen):.2f}% trainable)"
+        )
 
     # Barrier after model loading / Unsloth compilation
     if world_size > 1:
@@ -121,6 +151,9 @@ def train(args):
 
     model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
 
+    logger.info(f"Model dtype {model.type}")
+    logger.info(f"Model device: {model.device}")
+
     dataset = MyDataset(tokenizer)
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
@@ -129,9 +162,12 @@ def train(args):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
 
+    torch.cuda.reset_peak_memory_stats(current_device)
+
     model.train()
     if rank == 0:
         start = time.time()
+
     for epoch in range(args.epochs):
 
         sampler.set_epoch(epoch)
@@ -142,21 +178,46 @@ def train(args):
 
             batch = {key: batch[key].to(rank) for key in batch.keys()}
 
+            torch.cuda.synchronize(local_rank)
+            t0 = time.time()
+
             outputs = model(**batch)
 
             loss = outputs.loss
 
+            torch.cuda.synchronize(local_rank)
+            t1 = time.time()
+
             optimizer.zero_grad()
 
             loss.backward()
+            torch.cuda.synchronize(local_rank)
+            t2 = time.time()
 
             optimizer.step()
+            torch.cuda.synchronize(local_rank)
+            t3 = time.time()
 
             if rank == 0 and index % 10 == 0:
                 logger.info(f"Epoch {epoch} | Batch {index} | Loss: {loss.item():.4f}")
+                logger.info(
+                    f"Bt {index:04d} | "
+                    f"fwd {t1 - t0:.3f}s  bwd {t2 - t1:.3f}s  opt {t3 - t2:.3f}s  "
+                    f"step {t3 - t0:.3f}s"
+                )
+
     if rank == 0:
         end = time.time() - start
         logger.info(f"The estimated time on one GPU is {end:.4} s")
+
+        elapsed = time.time() - start
+        max_alloc = torch.cuda.max_memory_allocated(current_device) / 1024 ** 2  # MB
+        max_reserved = torch.cuda.max_memory_reserved(current_device) / 1024 ** 2
+
+        logger.info(f"Total wall-clock time : {elapsed:.1f} s")
+        logger.info(f"GPU peak allocated   : {max_alloc:.1f} MB")
+        logger.info(f"GPU peak reserved    : {max_reserved:.1f} MB")
+
     logger.info("We've done from training \U0001f604 \U0001F389 \U0001F389 \U0001F389 \U0001F389 \U0001F389 \U0001F389")
     cleanup()
 
@@ -170,6 +231,8 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=2)
 
     parser.add_argument('--epochs', type=int, default=1)
+
+    parser.add_argument('--use_lora', action='store_true', default=False)
 
     args = parser.parse_args()
 

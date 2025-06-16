@@ -7,6 +7,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import logging
 import shutil
 import time
+from peft import LoraConfig, get_peft_model
 
 
 def setup_logger(rank):
@@ -58,7 +59,7 @@ class MyDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         enc = self.tokenizer("Hello world!", return_tensors="pt", padding='max_length', padding_side='right',
-                             max_length=1024)
+                             max_length=4096)
         return {
 
             "input_ids": enc["input_ids"].squeeze(0),
@@ -85,8 +86,44 @@ def train(args):
 
     logger.info("Loading model with AutoModelForCausalLM.from_pretrained...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16,
+                                                 attn_implementation="flash_attention_2")
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+    if args.use_lora:
+        logger.info("Preparing LoRA adapters…")
+        lora_cfg = LoraConfig(
+            r=8,  # rank
+            lora_alpha=16,  # scaling
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+        )
+        model = get_peft_model(model, lora_cfg)
+        model.print_trainable_parameters()  # nice summary
+        logger.info("LoRA adapters ready.")
+
+    if rank == 0 and args.use_lora:
+        # log on the main process only
+        total_trainable = 0
+        total_frozen = 0
+        for p in model.parameters():
+            if p.requires_grad:
+                total_trainable += p.numel()
+            else:
+                total_frozen += p.numel()
+
+        logger.info(
+            f"Model parameter count ⇒ "
+            f"trainable: {total_trainable:,}  |  frozen: {total_frozen:,}  "
+            f"({100 * total_trainable / (total_trainable + total_frozen):.2f}% trainable)"
+        )
+
+    logger.info(f"Model dtype {model.dtype}")
 
     logger.info("Model and tokenizer loaded.")
 
@@ -109,13 +146,19 @@ def train(args):
 
     model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
 
+    logger.info(f"Model dtype {model.type}")
+    logger.info(f"Model device: {model.device}")
     dataset = MyDataset(tokenizer)
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
 
     loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=2, pin_memory=True)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
+    trainable_params = (p for p in model.parameters() if p.requires_grad)
+    optimizer = torch.optim.AdamW(trainable_params,
+                                  lr=2e-4 if args.use_lora else 2e-5)
+
+    torch.cuda.reset_peak_memory_stats(current_device)
 
     model.train()
     if rank == 0:
@@ -130,21 +173,48 @@ def train(args):
 
             batch = {key: batch[key].to(rank) for key in batch.keys()}
 
+            torch.cuda.synchronize(local_rank)
+            t0 = time.time()
+
             outputs = model(**batch)
 
             loss = outputs.loss
+
+            torch.cuda.synchronize(local_rank)
+            t1 = time.time()
 
             optimizer.zero_grad()
 
             loss.backward()
 
+            torch.cuda.synchronize(local_rank)
+            t2 = time.time()
+
             optimizer.step()
+
+            torch.cuda.synchronize(local_rank)
+            t3 = time.time()
 
             if rank == 0 and index % 10 == 0:
                 logger.info(f"Epoch {epoch} | Batch {index} | Loss: {loss.item():.4f}")
+                logger.info(
+                    f"Bt {index:04d} | "
+                    f"fwd {t1 - t0:.3f}s  bwd {t2 - t1:.3f}s  opt {t3 - t2:.3f}s  "
+                    f"step {t3 - t0:.3f}s"
+                )
+
     if rank == 0:
         end = time.time() - start
         logger.info(f"The estimated time on one GPU is {end:.4} s")
+
+        elapsed = time.time() - start
+        max_alloc = torch.cuda.max_memory_allocated(current_device) / 1024 ** 2  # MB
+        max_reserved = torch.cuda.max_memory_reserved(current_device) / 1024 ** 2
+
+        logger.info(f"Total wall-clock time : {elapsed:.1f} s")
+        logger.info(f"GPU peak allocated   : {max_alloc:.1f} MB")
+        logger.info(f"GPU peak reserved    : {max_reserved:.1f} MB")
+
     logger.info("We've done from training \U0001f604 \U0001F389 \U0001F389 \U0001F389 \U0001F389 \U0001F389 \U0001F389")
     cleanup()
 
@@ -158,6 +228,9 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=2)
 
     parser.add_argument('--epochs', type=int, default=1)
+
+    parser.add_argument('--use_lora', action='store_true', default=False,
+                        help="Inject LoRA adapters (default: False)")
 
     args = parser.parse_args()
 
