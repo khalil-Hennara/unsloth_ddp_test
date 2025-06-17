@@ -9,6 +9,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import logging
 import shutil
 import time
+import random 
+import numpy as np
+
+
+def set_seed():
+    torch.manual_seed(42)
+    random.seed(42)
+    np.random.seed(42)
 
 
 def setup_logger(rank):
@@ -95,6 +103,9 @@ class MyDataset(torch.utils.data.Dataset):
 
 
 def train(args):
+    
+    set_seed()
+    
     local_rank, world_size, rank = setup()
 
     current_device = torch.device(f"cuda:{local_rank}")

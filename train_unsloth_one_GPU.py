@@ -5,8 +5,16 @@ import torch.nn as nn  # noqa: F401  # kept for possible future use
 from torch.utils.data import DataLoader
 import logging
 import time
+import random 
+import numpy as np
 
 
+def set_seed():
+    torch.manual_seed(42)
+    random.seed(42)
+    np.random.seed(42)
+    
+    
 def setup_logger():
     """Return a process‑agnostic logger for single‑GPU runs."""
     logger = logging.getLogger("train")
@@ -48,7 +56,7 @@ class MyDataset(torch.utils.data.Dataset):
 
 def train(args):
     """Main training loop – *single GPU* (cuda:0) only."""
-
+    set_seed()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     logger = setup_logger()
     logger.info(f"Using device {device}")
