@@ -25,6 +25,32 @@ def setup_logger(rank):
     return logger
 
 
+def verify_initial_sync(model, rank, world_size, logger):
+    """
+    Verifies that the model weights are identical across all ranks after DDP initialization.
+    """
+    if world_size <= 1:
+        return
+
+    # Get the state dict from the current rank
+    current_rank_state_dict = model.module.state_dict()
+
+    # Gather all state dicts on rank 0
+    all_state_dicts = [None] * world_size
+    torch.distributed.all_gather_object(all_state_dicts, current_rank_state_dict)
+
+    if rank == 0:
+        logger.info("Verifying initial model synchronization across all ranks...")
+        first_state_dict = all_state_dicts[0]
+        for r in range(1, world_size):
+            for key in first_state_dict:
+                if not torch.equal(first_state_dict[key], all_state_dicts[r][key]):
+                    logger.error(f"Synchronization FAILED! Mismatch on rank {r} for key {key}.")
+                    # You could raise an exception here to stop the script
+                    raise RuntimeError("Initial model weights are not synchronized!")
+        logger.info("SUCCESS: Initial model weights are synchronized across all ranks.")
+        
+        
 def setup():
     # torchrun sets these environment variable
     local_rank = int(os.environ["LOCAL_RANK"])
