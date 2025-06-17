@@ -33,30 +33,52 @@ def setup_logger(rank):
     return logger
 
 
-def verify_initial_sync(model, rank, world_size, logger):
+def verify_initial_sync(model, logger):
     """
-    Verifies that the model weights are identical across all ranks after DDP initialization.
+    Verify that, right after creating the DistributedDataParallel (DDP) wrapper,
+    every rank holds exactly the same parameters.
+
+    •  Works with any world-size (early return for single-GPU runs)
+    •  Puts tensors on **CPU** before the comparison ⇒ no device mismatch
+    •  Uses `torch.no_grad()` and `detach()` to avoid autograd overhead
+    •  Logs a single SUCCESS / detailed FAILURE message from rank 0
     """
-    if world_size <= 1:
+    # ── Skip if not running DDP ──────────────────────────────────────────────────
+    if not dist.is_initialized() or dist.get_world_size() == 1:
         return
 
-    # Get the state dict from the current rank
-    current_rank_state_dict = model.module.state_dict()
+    rank        = dist.get_rank()
+    world_size  = dist.get_world_size()
 
-    # Gather all state dicts on rank 0
+    # ── Move the local state-dict to CPU so devices match ───────────────────────
+    with torch.no_grad():
+        cpu_state_dict = {
+            k: v.detach().cpu()           # ❶ cut the autograd graph
+            for k, v in model.module.state_dict().items()
+        }
+
+    # ── Gather every rank’s state-dict onto *every* rank (cheap: only CPU mem) ──
     all_state_dicts = [None] * world_size
-    torch.distributed.all_gather_object(all_state_dicts, current_rank_state_dict)
+    dist.all_gather_object(all_state_dicts, cpu_state_dict)
 
+    # ── Rank 0 does the heavy comparison and prints a verdict ──────────────────
     if rank == 0:
-        logger.info("Verifying initial model synchronization across all ranks...")
-        first_state_dict = all_state_dicts[0]
+        logger.info("Verifying initial model synchronisation across all ranks …")
+        ref_state = all_state_dicts[0]
+
         for r in range(1, world_size):
-            for key in first_state_dict:
-                if not torch.equal(first_state_dict[key], all_state_dicts[r][key]):
-                    logger.error(f"Synchronization FAILED! Mismatch on rank {r} for key {key}.")
-                    # You could raise an exception here to stop the script
-                    raise RuntimeError("Initial model weights are not synchronized!")
-        logger.info("SUCCESS: Initial model weights are synchronized across all ranks.")
+            for key, ref_tensor in ref_state.items():
+                other_tensor = all_state_dicts[r][key]
+                if not torch.equal(ref_tensor, other_tensor):
+                    logger.error(
+                        f"Sync FAILED – rank {r} differs on parameter “{key}”."
+                    )
+                    raise RuntimeError("Initial model weights are NOT synchronised!")
+
+        logger.info("SUCCESS – initial model weights are identical on all ranks.")
+
+    # ── Make sure everyone waits for rank 0 to finish logging before continuing ─
+    dist.barrier()
         
         
 def setup():
