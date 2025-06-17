@@ -111,11 +111,11 @@ class MyDataset(torch.utils.data.Dataset):
         self.tokenizer = tokenizer
 
     def __len__(self):
-        return 1000
+        return 10000
 
     def __getitem__(self, idx):
         enc = self.tokenizer("Hello world!", return_tensors="pt", padding='max_length', padding_side='right',
-                             max_length=4096)
+                             max_length=256)
         return {
 
             "input_ids": enc["input_ids"].squeeze(0),
@@ -213,6 +213,8 @@ def train(args):
     logger.info(f"Model dtype {model.type}")
     logger.info(f"Model device: {model.device}")
 
+    # verify_initial_sync(model, logger)
+    
     dataset = MyDataset(tokenizer)
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
@@ -258,10 +260,9 @@ def train(args):
             t3 = time.time()
 
             if rank == 0 and index % 10 == 0:
-                logger.info(f"Epoch {epoch} | Batch {index} | Loss: {loss.item():.4f}")
                 logger.info(
-                    f"Bt {index:04d} | "
-                    f"fwd {t1 - t0:.3f}s  bwd {t2 - t1:.3f}s  opt {t3 - t2:.3f}s  "
+                    f"Epoch {epoch} | Step {index} | Loss {loss.item():.8f} | "
+                    f"fwd {t1 - t0:.3f}s | bwd {t2 - t1:.3f}s | opt {t3 - t2:.3f}s | "
                     f"step {t3 - t0:.3f}s"
                 )
 
